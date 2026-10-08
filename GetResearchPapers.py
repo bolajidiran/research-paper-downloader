@@ -48,6 +48,7 @@ class PaperRecord:
     doi: str = ""
     venue: str = ""
     relevance_score: float = 0.0
+    relevance_breakdown: Dict[str, float] = field(default_factory=dict)
     raw_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def fingerprint(self) -> str:
@@ -123,43 +124,115 @@ def fetch_text(url: str, timeout: int = REQUEST_TIMEOUT) -> str:
 
 
 def extract_keywords(query: str) -> List[str]:
-    """Extract individual keywords from query."""
-    # Remove common stop words
-    stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "by", "from", "is", "are", "was", "were"}
-    words = query.lower().split()
-    return [w for w in words if len(w) > 2 and w not in stop_words]
+    """Extract individual keywords from query, prioritizing multi-word phrases."""
+    stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "by", "from", "is", "are", "was", "were", "be", "been"}
+    query_lower = query.lower()
+    
+    # First, try to extract meaningful multi-word phrases
+    phrases = []
+    words = query_lower.split()
+    
+    # Look for 2-3 word phrases
+    for i in range(len(words) - 1):
+        phrase = " ".join(words[i:i+2])
+        if not any(sw in phrase for sw in stop_words):
+            phrases.append(phrase)
+    
+    # Add individual keywords (length > 3 to avoid short words)
+    individual_words = [w for w in words if len(w) > 3 and w not in stop_words]
+    
+    # Combine and deduplicate
+    all_keywords = phrases + individual_words
+    seen = set()
+    result = []
+    for kw in all_keywords:
+        if kw not in seen:
+            result.append(kw)
+            seen.add(kw)
+    
+    return result[:10]  # Limit to top 10 keywords
 
 
-def calculate_relevance_score(record: PaperRecord, query: str) -> float:
-    """Calculate relevance score based on keyword presence in title/abstract."""
+def calculate_relevance_score(record: PaperRecord, query: str) -> Tuple[float, Dict[str, float]]:
+    """
+    Calculate relevance score with detailed breakdown.
+    Weights:
+      - Exact phrase match in title: 1.0
+      - Multi-word phrase in title: 0.8
+      - Single keyword in title: 0.6
+      - Exact phrase in abstract: 0.6
+      - Multi-word phrase in abstract: 0.4
+      - Single keyword in abstract: 0.2
+      - Author relevance bonus: 0.1
+      - Venue/journal quality bonus: 0.05
+    """
     keywords = extract_keywords(query)
     if not keywords:
-        return 0.5
-
+        return 0.5, {"no_keywords": 0.5}
+    
+    breakdown: Dict[str, float] = {}
     title_lower = record.title.lower()
     abstract_lower = record.abstract.lower()
-    combined_text = f"{title_lower} {abstract_lower}"
-
-    score = 0.0
-    matched_keywords = 0
-
+    
+    title_score = 0.0
+    abstract_score = 0.0
+    author_score = 0.0
+    venue_score = 0.0
+    
+    matched_phrases = set()
+    
+    # Check for phrase matches (2+ word combinations)
+    for i in range(len(keywords) - 1):
+        phrase = keywords[i] + " " + keywords[i + 1]
+        if phrase in title_lower:
+            title_score += 0.8
+            matched_phrases.add(phrase)
+        elif phrase in abstract_lower:
+            abstract_score += 0.4
+            matched_phrases.add(phrase)
+    
+    # Check for individual keyword matches
     for keyword in keywords:
-        # Title match weights more (0.6)
+        if keyword in matched_phrases:
+            continue
+        
+        # Title matches (highest weight)
         if keyword in title_lower:
-            score += 0.6
-            matched_keywords += 1
-        # Abstract match weights less (0.3)
+            title_score += 0.6
+        # Abstract matches (medium weight)
         elif keyword in abstract_lower:
-            score += 0.3
-            matched_keywords += 1
-
-    # Normalize score: max 1.0
-    if matched_keywords > 0:
-        score = min(score / (len(keywords) * 0.6), 1.0)
-    else:
-        score = 0.0
-
-    return score
+            abstract_score += 0.2
+    
+    # Author relevance bonus
+    authors_text = " ".join(record.authors).lower()
+    for keyword in keywords:
+        if keyword in authors_text and len(keyword) > 4:
+            author_score += 0.05
+    
+    # Venue/journal quality bonus (if venue is mentioned in query)
+    if record.venue:
+        venue_lower = record.venue.lower()
+        for keyword in keywords:
+            if keyword in venue_lower:
+                venue_score += 0.05
+    
+    breakdown["title_score"] = min(title_score, 1.0)
+    breakdown["abstract_score"] = min(abstract_score, 1.0)
+    breakdown["author_score"] = min(author_score, 0.2)
+    breakdown["venue_score"] = min(venue_score, 0.1)
+    
+    # Weighted combination
+    total_score = (
+        breakdown["title_score"] * 0.50 +
+        breakdown["abstract_score"] * 0.35 +
+        breakdown["author_score"] * 0.10 +
+        breakdown["venue_score"] * 0.05
+    )
+    
+    final_score = min(max(total_score, 0.0), 1.0)
+    breakdown["final_score"] = final_score
+    
+    return final_score, breakdown
 
 
 def strict_filter_records(records: List[PaperRecord], query: str) -> List[PaperRecord]:
@@ -173,9 +246,9 @@ def strict_filter_records(records: List[PaperRecord], query: str) -> List[PaperR
         title_lower = record.title.lower()
         abstract_lower = record.abstract.lower()
         
-        # Check if at least 2 keywords appear in title+abstract
+        # Check if at least 50% of keywords appear in title+abstract
         keyword_count = sum(1 for kw in keywords if kw in title_lower or kw in abstract_lower)
-        if keyword_count >= len(keywords) * 0.5:  # At least 50% of keywords must match
+        if keyword_count >= len(keywords) * 0.5:
             filtered.append(record)
 
     return filtered
@@ -208,6 +281,71 @@ def deduplicate_records(records: Sequence[PaperRecord]) -> List[PaperRecord]:
     return unique
 
 
+def get_search_log_path(base_dir: Path) -> Path:
+    """Get the path for the search log file."""
+    log_dir = base_dir / ".search_logs"
+    ensure_dir(log_dir)
+    return log_dir / "search_history.jsonl"
+
+
+def log_search(base_dir: Path, query: str, source: str, results_count: int, strict_match: bool, min_relevance: float, filters: Dict[str, Any]):
+    """Log the search to a JSONL file."""
+    log_path = get_search_log_path(base_dir)
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "query": query,
+        "source": source,
+        "results_count": results_count,
+        "strict_match": strict_match,
+        "min_relevance": min_relevance,
+        "filters": filters,
+    }
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception as exc:
+        print(f"Warning: Could not write to search log: {exc}")
+
+
+def get_search_history(base_dir: Path, limit: int = 50) -> List[Dict[str, Any]]:
+    """Retrieve recent searches from log."""
+    log_path = get_search_log_path(base_dir)
+    if not log_path.exists():
+        return []
+    
+    history = []
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        history.append(entry)
+                    except json.JSONDecodeError:
+                        continue
+    except Exception as exc:
+        print(f"Warning: Could not read search log: {exc}")
+    
+    return history[-limit:]
+
+
+def print_search_history(base_dir: Path):
+    """Print recent search history."""
+    history = get_search_history(base_dir)
+    if not history:
+        print("No search history available.")
+        return
+    
+    print("\n=== Recent Search History ===")
+    for i, entry in enumerate(history[-10:], start=1):
+        print(f"\n[{i}] {entry.get('timestamp', 'Unknown')}")
+        print(f"    Query: {entry.get('query', 'N/A')}")
+        print(f"    Source: {entry.get('source', 'N/A')}")
+        print(f"    Results: {entry.get('results_count', 0)}")
+        print(f"    Strict Match: {entry.get('strict_match', False)}")
+        print(f"    Min Relevance: {entry.get('min_relevance', 0.0):.0%}")
+
+
 def save_metadata_json(record: PaperRecord, file_path: Path):
     payload = {
         "title": record.title,
@@ -221,6 +359,7 @@ def save_metadata_json(record: PaperRecord, file_path: Path):
         "doi": record.doi,
         "venue": record.venue,
         "relevance_score": record.relevance_score,
+        "relevance_breakdown": record.relevance_breakdown,
         "saved_at": datetime.utcnow().isoformat() + "Z",
         "raw_metadata": record.raw_metadata,
     }
@@ -238,7 +377,8 @@ def save_text_fallback(record: PaperRecord, file_path: Path):
         f"PDF URL: {record.pdf_url or 'Not available'}\n"
         f"DOI: {record.doi or 'Not available'}\n"
         f"Venue: {record.venue or 'Not available'}\n"
-        f"Relevance Score: {record.relevance_score:.2f}\n\n"
+        f"Relevance Score: {record.relevance_score:.2%}\n"
+        f"Relevance Breakdown: {json.dumps(record.relevance_breakdown, indent=2)}\n\n"
         f"Abstract:\n{record.abstract or 'No abstract available.'}\n"
     )
     with open(file_path, "w", encoding="utf-8") as f:
@@ -314,9 +454,9 @@ def parse_arxiv(query: str, limit: int = 10) -> List[PaperRecord]:
                 pdf_url=pdf_url,
                 category="arXiv",
                 doi="",
-                venue="",
+                venue="arXiv",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
         return records
     except Exception as exc:
@@ -354,7 +494,7 @@ def parse_pubmed_search_json(data: Dict[str, Any], query: str, limit: int) -> Li
                 venue=doc.get("fulljournalname", ""),
                 raw_metadata=doc,
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
         except Exception as exc:
             print(f"PubMed item {pmid} failed: {exc}")
@@ -376,18 +516,18 @@ def search_pubmed(query: str, limit: int = 10) -> List[PaperRecord]:
 
 
 def parse_biorxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
-    """Improved bioRxiv HTML parsing."""
+    """Improved bioRxiv HTML parsing with better metadata extraction."""
     soup = BeautifulSoup(html, "html.parser")
     results: List[PaperRecord] = []
     seen: set[str] = set()
 
-    # Look for article containers with specific structure
-    articles = soup.select("div.highwire-article-container") or soup.select("article") or soup.select("div[class*='article']")
+    # Target biorxiv article result containers
+    articles = soup.select("div.highwire-article-container") or soup.select("article.result") or soup.select("div[data-test*='result']")
     
     for article_elem in articles[:limit * 2]:
         try:
-            # Extract title
-            title_elem = article_elem.select_one("h2 a") or article_elem.select_one("h3 a") or article_elem.select_one("a[href*='/content/']")
+            # Extract title and URL
+            title_elem = article_elem.select_one("h2 a, h3 a, a[href*='/content/']")
             if not title_elem:
                 continue
             
@@ -398,28 +538,37 @@ def parse_biorxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 continue
             seen.add(href)
 
-            # Extract authors
+            # Extract authors with better parsing
             authors = []
-            author_elems = article_elem.select("span[class*='author'], .author-name, .contrib-author")
-            for auth in author_elems[:5]:
+            author_elems = article_elem.select("span.nlm-person-name, span.contrib-author, a[rel='author']")
+            for auth in author_elems[:10]:
                 name = auth.get_text(strip=True)
-                if name and len(name) > 2:
+                if name and len(name) > 2 and "@" not in name:
                     authors.append(name)
 
             # Extract abstract
             abstract = ""
-            abstract_elem = article_elem.select_one("p.summary, .abstract, [class*='abstract']")
+            abstract_elem = article_elem.select_one("p.summary, p.abstract, div.summary")
             if abstract_elem:
                 abstract = " ".join(abstract_elem.get_text(" ", strip=True).split())[:500]
 
-            # Extract year
+            # Extract publication date and year
             year = "Unknown"
-            date_elem = article_elem.select_one("span[class*='date'], time, .published-date")
+            date_elem = article_elem.select_one("span.published-date, time, span.date, div.published")
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 year_match = re.search(r"(20\d{2})", date_text)
                 if year_match:
                     year = year_match.group(1)
+
+            # Extract DOI if available
+            doi = ""
+            doi_elem = article_elem.select_one("a[href*='doi.org']")
+            if doi_elem:
+                doi_href = doi_elem.get("href", "")
+                doi_match = re.search(r"10\.\d{4,9}/[^/\s]+", doi_href)
+                if doi_match:
+                    doi = doi_match.group(0)
 
             full_url = f"https://www.biorxiv.org{href}" if not href.startswith("http") else href
             
@@ -430,10 +579,12 @@ def parse_biorxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 source="bioRxiv",
                 year=year,
                 url=full_url,
-                pdf_url="",
+                pdf_url=f"{full_url}.full.pdf" if "/content/" in full_url else "",
                 category="bioRxiv",
+                doi=doi,
+                venue="bioRxiv",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             results.append(record)
             
             if len(results) >= limit:
@@ -454,16 +605,16 @@ def search_biorxiv(query: str, limit: int = 10) -> List[PaperRecord]:
 
 
 def parse_medrxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
-    """Improved medRxiv HTML parsing."""
+    """Improved medRxiv HTML parsing with better metadata extraction."""
     soup = BeautifulSoup(html, "html.parser")
     results: List[PaperRecord] = []
     seen: set[str] = set()
 
-    articles = soup.select("div.highwire-article-container") or soup.select("article") or soup.select("div[class*='article']")
+    articles = soup.select("div.highwire-article-container") or soup.select("article.result") or soup.select("div[data-test*='result']")
     
     for article_elem in articles[:limit * 2]:
         try:
-            title_elem = article_elem.select_one("h2 a") or article_elem.select_one("h3 a") or article_elem.select_one("a[href*='/content/']")
+            title_elem = article_elem.select_one("h2 a, h3 a, a[href*='/content/']")
             if not title_elem:
                 continue
             
@@ -475,24 +626,32 @@ def parse_medrxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
             seen.add(href)
 
             authors = []
-            author_elems = article_elem.select("span[class*='author'], .author-name, .contrib-author")
-            for auth in author_elems[:5]:
+            author_elems = article_elem.select("span.nlm-person-name, span.contrib-author, a[rel='author']")
+            for auth in author_elems[:10]:
                 name = auth.get_text(strip=True)
-                if name and len(name) > 2:
+                if name and len(name) > 2 and "@" not in name:
                     authors.append(name)
 
             abstract = ""
-            abstract_elem = article_elem.select_one("p.summary, .abstract, [class*='abstract']")
+            abstract_elem = article_elem.select_one("p.summary, p.abstract, div.summary")
             if abstract_elem:
                 abstract = " ".join(abstract_elem.get_text(" ", strip=True).split())[:500]
 
             year = "Unknown"
-            date_elem = article_elem.select_one("span[class*='date'], time, .published-date")
+            date_elem = article_elem.select_one("span.published-date, time, span.date, div.published")
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 year_match = re.search(r"(20\d{2})", date_text)
                 if year_match:
                     year = year_match.group(1)
+
+            doi = ""
+            doi_elem = article_elem.select_one("a[href*='doi.org']")
+            if doi_elem:
+                doi_href = doi_elem.get("href", "")
+                doi_match = re.search(r"10\.\d{4,9}/[^/\s]+", doi_href)
+                if doi_match:
+                    doi = doi_match.group(0)
 
             full_url = f"https://www.medrxiv.org{href}" if not href.startswith("http") else href
             
@@ -503,10 +662,12 @@ def parse_medrxiv_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 source="medRxiv",
                 year=year,
                 url=full_url,
-                pdf_url="",
+                pdf_url=f"{full_url}.full.pdf" if "/content/" in full_url else "",
                 category="medRxiv",
+                doi=doi,
+                venue="medRxiv",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             results.append(record)
             
             if len(results) >= limit:
@@ -527,13 +688,13 @@ def search_medrxiv(query: str, limit: int = 10) -> List[PaperRecord]:
 
 
 def parse_ieee_html(html: str, query: str, limit: int) -> List[PaperRecord]:
-    """Improved IEEE Xplore HTML parsing."""
+    """Improved IEEE Xplore HTML parsing with better metadata extraction."""
     soup = BeautifulSoup(html, "html.parser")
     records: List[PaperRecord] = []
     seen: set[str] = set()
 
-    # Look for result rows/articles
-    result_items = soup.select("div[class*='result'], article[class*='result'], tr[class*='result']")
+    # IEEE typically uses specific result row classes
+    result_items = soup.select("div.result-item, article[data-test*='result'], tr[data-test*='result']")
     if not result_items:
         result_items = soup.select("a[href*='document/']")
 
@@ -551,28 +712,43 @@ def parse_ieee_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 continue
             seen.add(href)
 
-            # Extract authors
+            # Extract authors with better parsing
             authors = []
-            author_container = item.select("span[class*='author'], .author, .by")
-            for auth_elem in author_container[:5]:
+            author_container = item.select("span.author, a.author, .contrib-author, span[data-test*='author']")
+            for auth_elem in author_container[:10]:
                 auth_text = auth_elem.get_text(strip=True)
-                if auth_text and len(auth_text) > 2:
-                    authors.append(auth_text)
+                if auth_text and len(auth_text) > 2 and not auth_text.endswith(";"):
+                    authors.append(auth_text.rstrip(";"))
 
-            # Extract abstract (often not available in search results)
+            # Extract abstract
             abstract = ""
-            abstract_elem = item.select_one("p[class*='abstract'], .abstract")
+            abstract_elem = item.select_one("p.abstract, span.abstract, div[class*='abstract']")
             if abstract_elem:
                 abstract = " ".join(abstract_elem.get_text(" ", strip=True).split())[:500]
 
-            # Extract year
+            # Extract year and publication date
             year = "Unknown"
-            date_elem = item.select_one("span[class*='date'], .date, .publish-date")
+            date_elem = item.select_one("span.publish-date, span.date, time, div.date")
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 year_match = re.search(r"(20\d{2})", date_text)
                 if year_match:
                     year = year_match.group(1)
+
+            # Extract DOI
+            doi = ""
+            doi_elem = item.select_one("a[href*='doi.org']")
+            if doi_elem:
+                doi_text = doi_elem.get_text(strip=True)
+                doi_match = re.search(r"10\.\d{4,9}/[^/\s]+", doi_text)
+                if doi_match:
+                    doi = doi_match.group(0)
+
+            # Extract venue/conference
+            venue = ""
+            venue_elem = item.select_one("span.conference, span.journal, div.publication")
+            if venue_elem:
+                venue = venue_elem.get_text(strip=True)[:100]
 
             full_url = f"https://ieeexplore.ieee.org{href}" if not href.startswith("http") else href
 
@@ -583,10 +759,12 @@ def parse_ieee_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 source="IEEE Xplore",
                 year=year,
                 url=full_url,
-                pdf_url="",
+                pdf_url="",  # IEEE requires authentication for PDFs
                 category="IEEE Xplore",
+                doi=doi,
+                venue=venue or "IEEE Xplore",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
 
             if len(records) >= limit:
@@ -607,12 +785,12 @@ def search_ieee(query: str, limit: int = 10) -> List[PaperRecord]:
 
 
 def parse_springer_html(html: str, query: str, limit: int) -> List[PaperRecord]:
-    """Improved SpringerLink HTML parsing."""
+    """Improved SpringerLink HTML parsing with better metadata extraction."""
     soup = BeautifulSoup(html, "html.parser")
     records: List[PaperRecord] = []
     seen: set[str] = set()
 
-    result_items = soup.select("div[data-test*='result'], article[class*='result'], li[class*='result']")
+    result_items = soup.select("article[data-test*='result'], div.result-item, li[data-test*='result']")
     if not result_items:
         result_items = soup.select("a[href*='/article/']")
 
@@ -629,25 +807,43 @@ def parse_springer_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 continue
             seen.add(href)
 
+            # Extract authors
             authors = []
-            author_elems = item.select("a[data-test*='author'], span[class*='author']")
-            for auth_elem in author_elems[:5]:
+            author_elems = item.select("a[data-test*='author'], span.author, a[rel='author']")
+            for auth_elem in author_elems[:10]:
                 auth_text = auth_elem.get_text(strip=True)
                 if auth_text and len(auth_text) > 2:
                     authors.append(auth_text)
 
+            # Extract abstract
             abstract = ""
-            abstract_elem = item.select_one("p[class*='abstract'], .abstract")
+            abstract_elem = item.select_one("p.abstract, p.summary, div[class*='abstract']")
             if abstract_elem:
                 abstract = " ".join(abstract_elem.get_text(" ", strip=True).split())[:500]
 
+            # Extract year
             year = "Unknown"
-            date_elem = item.select_one("span[class*='date'], time")
+            date_elem = item.select_one("span.date, time, span[class*='date']")
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 year_match = re.search(r"(20\d{2})", date_text)
                 if year_match:
                     year = year_match.group(1)
+
+            # Extract DOI
+            doi = ""
+            doi_elem = item.select_one("a[href*='doi.org']")
+            if doi_elem:
+                doi_text = doi_elem.get_text(strip=True)
+                doi_match = re.search(r"10\.\d{4,9}/[^/\s]+", doi_text)
+                if doi_match:
+                    doi = doi_match.group(0)
+
+            # Extract journal/venue
+            venue = ""
+            venue_elem = item.select_one("span.journal, div.journal, p.journal")
+            if venue_elem:
+                venue = venue_elem.get_text(strip=True)[:100]
 
             full_url = f"https://link.springer.com{href}" if not href.startswith("http") else href
 
@@ -658,10 +854,12 @@ def parse_springer_html(html: str, query: str, limit: int) -> List[PaperRecord]:
                 source="SpringerLink",
                 year=year,
                 url=full_url,
-                pdf_url="",
+                pdf_url="",  # Springer requires authentication
                 category="SpringerLink",
+                doi=doi,
+                venue=venue or "SpringerLink",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
 
             if len(records) >= limit:
@@ -682,12 +880,12 @@ def search_springer(query: str, limit: int = 10) -> List[PaperRecord]:
 
 
 def parse_sciencedirect_html(html: str, query: str, limit: int) -> List[PaperRecord]:
-    """Improved ScienceDirect HTML parsing."""
+    """Improved ScienceDirect HTML parsing with better metadata extraction."""
     soup = BeautifulSoup(html, "html.parser")
     records: List[PaperRecord] = []
     seen: set[str] = set()
 
-    result_items = soup.select("div[class*='result'], article[class*='result']")
+    result_items = soup.select("article[data-test*='result'], div.result-item")
     if not result_items:
         result_items = soup.select("a[href*='/science/article/']")
 
@@ -704,25 +902,43 @@ def parse_sciencedirect_html(html: str, query: str, limit: int) -> List[PaperRec
                 continue
             seen.add(href)
 
+            # Extract authors
             authors = []
-            author_elems = item.select("span[class*='author'], .author")
-            for auth_elem in author_elems[:5]:
+            author_elems = item.select("span.author, a.author, div[data-test*='author']")
+            for auth_elem in author_elems[:10]:
                 auth_text = auth_elem.get_text(strip=True)
                 if auth_text and len(auth_text) > 2:
                     authors.append(auth_text)
 
+            # Extract abstract
             abstract = ""
-            abstract_elem = item.select_one("p[class*='abstract'], .abstract")
+            abstract_elem = item.select_one("p.abstract, div.abstract, span[class*='abstract']")
             if abstract_elem:
                 abstract = " ".join(abstract_elem.get_text(" ", strip=True).split())[:500]
 
+            # Extract year
             year = "Unknown"
-            date_elem = item.select_one("span[class*='date'], time, .date")
+            date_elem = item.select_one("span.date, time, span.publication-date")
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 year_match = re.search(r"(20\d{2})", date_text)
                 if year_match:
                     year = year_match.group(1)
+
+            # Extract DOI
+            doi = ""
+            doi_elem = item.select_one("a[href*='doi.org'], span.doi")
+            if doi_elem:
+                doi_text = doi_elem.get_text(strip=True)
+                doi_match = re.search(r"10\.\d{4,9}/[^/\s]+", doi_text)
+                if doi_match:
+                    doi = doi_match.group(0)
+
+            # Extract journal
+            venue = ""
+            venue_elem = item.select_one("span.journal, div.journal, p.journal")
+            if venue_elem:
+                venue = venue_elem.get_text(strip=True)[:100]
 
             full_url = f"https://www.sciencedirect.com{href}" if not href.startswith("http") else href
 
@@ -733,10 +949,12 @@ def parse_sciencedirect_html(html: str, query: str, limit: int) -> List[PaperRec
                 source="ScienceDirect",
                 year=year,
                 url=full_url,
-                pdf_url="",
+                pdf_url="",  # ScienceDirect requires authentication
                 category="ScienceDirect",
+                doi=doi,
+                venue=venue or "ScienceDirect",
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
 
             if len(records) >= limit:
@@ -782,10 +1000,10 @@ def search_google_scholar(query: str, limit: int = 10) -> List[PaperRecord]:
                 pdf_url=pdf_url,
                 category="Google Scholar",
                 doi=item.get("doi", ""),
-                venue=item.get("venue", ""),
+                venue=item.get("venue", "") or "Google Scholar",
                 raw_metadata=item,
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             results.append(record)
         return results
     except Exception as exc:
@@ -808,7 +1026,7 @@ def search_openalex(query: str, limit: int = 10) -> List[PaperRecord]:
             abstract = decode_inverted_index(item.get("abstract_inverted_index"))
             year = str(item.get("publication_year", "Unknown"))
             primary = item.get("primary_location", {})
-            venue = primary.get("source", {}).get("display_name", "")
+            venue = primary.get("source", {}).get("display_name", "") or "OpenAlex"
             url_value = item.get("primary_location", {}).get("landing_page_url", "") or item.get("url", "")
             doi = item.get("doi", "").replace("https://doi.org/", "") if item.get("doi") else ""
             
@@ -825,7 +1043,7 @@ def search_openalex(query: str, limit: int = 10) -> List[PaperRecord]:
                 venue=venue,
                 raw_metadata=item,
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
         return records
     except Exception as exc:
@@ -848,6 +1066,7 @@ def search_semantic_scholar(query: str, limit: int = 10) -> List[PaperRecord]:
             year = str(item.get("year", "Unknown"))
             url_value = item.get("url", "")
             doi = item.get("externalIds", {}).get("DOI", "") if item.get("externalIds") else ""
+            venue = item.get("venue", "") or "Semantic Scholar"
             
             record = PaperRecord(
                 title=item.get("title", "Untitled"),
@@ -859,10 +1078,10 @@ def search_semantic_scholar(query: str, limit: int = 10) -> List[PaperRecord]:
                 pdf_url="",
                 category="Semantic Scholar",
                 doi=doi,
-                venue=item.get("venue", ""),
+                venue=venue,
                 raw_metadata=item,
             )
-            record.relevance_score = calculate_relevance_score(record, query)
+            record.relevance_score, record.relevance_breakdown = calculate_relevance_score(record, query)
             records.append(record)
         return records
     except Exception as exc:
@@ -969,10 +1188,12 @@ def print_results(records: Sequence[PaperRecord]) -> None:
     for i, record in enumerate(records, start=1):
         print(f"\n[{i}] {record.title}")
         print(f"Authors: {', '.join(record.authors) if record.authors else 'Unknown'}")
-        print(f"Source: {record.source} | Year: {record.year} | Category: {record.category}")
-        print(f"Relevance Score: {record.relevance_score:.2%}")
+        print(f"Source: {record.source} | Year: {record.year} | Venue: {record.category}")
+        print(f"Relevance Score: {record.relevance_score:.1%} | Title: {record.relevance_breakdown.get('title_score', 0):.1%} | Abstract: {record.relevance_breakdown.get('abstract_score', 0):.1%}")
         print(f"URL: {record.url or 'Not available'}")
         print(f"PDF URL: {record.pdf_url or 'Not available'}")
+        if record.doi:
+            print(f"DOI: {record.doi}")
         if record.abstract:
             print(f"Abstract: {record.abstract[:350]}..." if len(record.abstract) > 350 else f"Abstract: {record.abstract}")
 
@@ -1043,7 +1264,7 @@ def parse_pdf_and_update(record: PaperRecord, pdf_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download research papers from multiple sources with relevance filtering.")
+    parser = argparse.ArgumentParser(description="Download research papers from multiple sources with advanced relevance filtering and search logging.")
     parser.add_argument("--query", help="Search query. Example: 'transformer medical imaging'")
     parser.add_argument("--batch-file", help="Text file with one query per line.")
     parser.add_argument("--source", choices=[
@@ -1060,6 +1281,7 @@ def main():
     parser.add_argument("--year-end", type=int, default=None)
     parser.add_argument("--strict-match", action="store_true", help="Only keep papers with keywords in title or abstract.")
     parser.add_argument("--min-relevance", type=float, default=0.0, help="Minimum relevance score (0.0-1.0) to include results.")
+    parser.add_argument("--show-history", action="store_true", help="Show recent search history and exit.")
     args = parser.parse_args()
 
     if args.storage_dir:
@@ -1068,6 +1290,11 @@ def main():
         base_dir = prompt_for_storage_dir()
 
     ensure_dir(base_dir)
+
+    # Handle history display
+    if args.show_history:
+        print_search_history(base_dir)
+        return
 
     queries: List[str] = []
     if args.batch_file:
@@ -1106,6 +1333,23 @@ def main():
             year_end=args.year_end,
         )
         all_records.extend(filtered)
+        
+        # Log search
+        log_search(
+            base_dir,
+            query=query,
+            source=args.source,
+            results_count=len(filtered),
+            strict_match=args.strict_match,
+            min_relevance=args.min_relevance,
+            filters={
+                "author": args.author,
+                "title": args.title,
+                "category": args.category,
+                "year_start": args.year_start,
+                "year_end": args.year_end,
+            }
+        )
 
     unique_records = deduplicate_records(all_records)
     
@@ -1128,6 +1372,8 @@ def main():
             print(f"Saved: {saved_path}")
 
     print(f"\nStorage directory: {base_dir}")
+    print(f"Search history: {get_search_log_path(base_dir)}")
+    print(f"Tip: Run with --show-history to view recent searches")
 
 
 if __name__ == "__main__":
